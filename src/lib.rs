@@ -39,6 +39,52 @@ pub enum UploadStyle {
     Staging,
 }
 
+enum ReadMapFn<MapFut, BufFunc, BufFut>
+where
+    MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+    BufFunc: FnOnce(&Buffer) -> BufFut,
+    BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+{
+    Mapped(MapFut),
+    Buffed(Buffer, BufFunc),
+}
+
+impl<MapFut, BufFunc, BufFut> ReadMapFn<MapFut, BufFunc, BufFut>
+where
+    MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+    BufFunc: FnOnce(&Buffer) -> BufFut,
+    BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+{
+    fn prepare_future(self) -> ReadMap<MapFut, BufFut> {
+        match self {
+            ReadMapFn::Buffed(buffer, func) => ReadMap::Buffed(func(&buffer)),
+            ReadMapFn::Mapped(mapped) => ReadMap::Mapped(mapped),
+        }
+    }
+}
+
+enum ReadMap<MapFut, BufFut>
+where
+    MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+    BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+{
+    Mapped(MapFut),
+    Buffed(BufFut),
+}
+
+impl<MapFut, BufFut> ReadMap<MapFut, BufFut>
+where
+    MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+    BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+{
+    async fn await_future(self) -> Result<BufferReadMapping, BufferAsyncErr> {
+        match self {
+            ReadMap::Mapped(fut) => fut.await,
+            ReadMap::Buffed(fut) => fut.await,
+        }
+    }
+}
+
 struct AutomatedBuffer {
     inner: Buffer,
     style: UploadStyle,
@@ -68,19 +114,29 @@ impl AutomatedBuffer {
         Self { inner, style, size }
     }
 
-    fn map_read<T: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>>(
-        mapping: T,
-    ) -> impl Future<Output = BufferReadMapping> {
-        async move { mapping.await.unwrap() }
+    fn map_read<MapFut, BufFunc, BufFut>(
+        mapping: ReadMapFn<MapFut, BufFunc, BufFut>,
+    ) -> impl Future<Output = impl Future<Output = BufferReadMapping>>
+    where
+        MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+        BufFunc: FnOnce(&Buffer) -> BufFut,
+        BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+    {
+        async move {
+            let future = mapping.prepare_future();
+            async move { future.await_future().await.unwrap() }
+        }
     }
 
-    pub fn read_from_buffer<'a>(
+    pub fn read_from_buffer(
         &mut self,
         device: &Device,
         encoder: &mut CommandEncoder,
-    ) -> impl Future<Output = BufferReadMapping> {
+    ) -> impl Future<Output = impl Future<Output = BufferReadMapping>> {
         match self.style {
-            UploadStyle::Mapping => Self::map_read(self.inner.map_read(0, self.size)),
+            UploadStyle::Mapping => {
+                Self::map_read(ReadMapFn::Mapped(self.inner.map_read(0, self.size)))
+            }
             UploadStyle::Staging => {
                 let staging = device.create_buffer(&BufferDescriptor {
                     size: self.size,
@@ -88,7 +144,10 @@ impl AutomatedBuffer {
                     label: Some("read dst buffer"),
                 });
                 encoder.copy_buffer_to_buffer(&self.inner, 0, &staging, 0, self.size);
-                Self::map_read(staging.map_read(0, self.size))
+                let size = self.size;
+                Self::map_read(ReadMapFn::Buffed(staging, move |staging| {
+                    staging.map_read(0, size)
+                }))
             }
         }
     }
@@ -321,8 +380,9 @@ impl GPUAddition {
             .read_from_buffer(&self.device, &mut encoder);
 
         self.queue.submit(&[encoder.finish()]);
-        self.device.poll(Maintain::Wait);
 
+        let map_left = map_left.await;
+        self.device.poll(Maintain::Wait);
         map_left.await
     }
 }
