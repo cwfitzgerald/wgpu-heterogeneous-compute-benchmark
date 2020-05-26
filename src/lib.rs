@@ -39,21 +39,19 @@ pub enum UploadStyle {
     Staging,
 }
 
-enum ReadMapFn<MapFut, BufFunc, BufFut>
-where
-    MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
-    BufFunc: FnOnce(&Buffer) -> BufFut,
-    BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
-{
+type BufferReadResult = Result<BufferReadMapping, BufferAsyncErr>;
+type BufferWriteResult = Result<BufferWriteMapping, BufferAsyncErr>;
+
+enum ReadMapFn<MapFut, BufFunc> {
     Mapped(MapFut),
     Buffed(Buffer, BufFunc),
 }
 
-impl<MapFut, BufFunc, BufFut> ReadMapFn<MapFut, BufFunc, BufFut>
+impl<MapFut, BufFunc, BufFut> ReadMapFn<MapFut, BufFunc>
 where
-    MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+    MapFut: Future<Output = BufferReadResult>,
     BufFunc: FnOnce(&Buffer) -> BufFut,
-    BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+    BufFut: Future<Output = BufferReadResult>,
 {
     fn prepare_future(self) -> ReadMap<MapFut, BufFut> {
         match self {
@@ -63,21 +61,17 @@ where
     }
 }
 
-enum ReadMap<MapFut, BufFut>
-where
-    MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
-    BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
-{
+enum ReadMap<MapFut, BufFut> {
     Mapped(MapFut),
     Buffed(BufFut),
 }
 
 impl<MapFut, BufFut> ReadMap<MapFut, BufFut>
 where
-    MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
-    BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+    MapFut: Future<Output = BufferReadResult>,
+    BufFut: Future<Output = BufferReadResult>,
 {
-    async fn await_future(self) -> Result<BufferReadMapping, BufferAsyncErr> {
+    async fn await_future(self) -> BufferReadResult {
         match self {
             ReadMap::Mapped(fut) => fut.await,
             ReadMap::Buffed(fut) => fut.await,
@@ -115,12 +109,12 @@ impl AutomatedBuffer {
     }
 
     fn map_read<MapFut, BufFunc, BufFut>(
-        mapping: ReadMapFn<MapFut, BufFunc, BufFut>,
+        mapping: ReadMapFn<MapFut, BufFunc>,
     ) -> impl Future<Output = impl Future<Output = BufferReadMapping>>
     where
-        MapFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+        MapFut: Future<Output = BufferReadResult>,
         BufFunc: FnOnce(&Buffer) -> BufFut,
-        BufFut: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>,
+        BufFut: Future<Output = BufferReadResult>,
     {
         async move {
             let future = mapping.prepare_future();
@@ -154,7 +148,7 @@ impl AutomatedBuffer {
 
     fn map_write<'a>(
         data: &'a [u8],
-        mapping: Option<impl Future<Output = Result<BufferWriteMapping, BufferAsyncErr>> + 'a>,
+        mapping: Option<impl Future<Output = BufferWriteResult> + 'a>,
     ) -> impl Future<Output = ()> + 'a {
         async move {
             if let Some(mapping) = mapping {
