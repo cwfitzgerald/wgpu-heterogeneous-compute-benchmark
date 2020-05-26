@@ -1,0 +1,385 @@
+#![allow(clippy::cast_ptr_alignment)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::float_cmp)]
+
+use rayon::prelude::*;
+use std::future::Future;
+use std::io::Cursor;
+use std::ops::Deref;
+use wgpu::*;
+use zerocopy::AsBytes;
+
+pub fn addition(left: &mut [f32], right: &[f32]) {
+    for i in 0..left.len() {
+        left[i] += right[i];
+    }
+}
+
+pub unsafe fn addition_unchecked(left: &mut [f32], right: &[f32]) {
+    for i in 0..left.len() {
+        *left.get_unchecked_mut(i) += *right.get_unchecked(i);
+    }
+}
+
+pub fn addition_iterator(left: &mut [f32], right: &[f32]) {
+    left.iter_mut()
+        .zip(right.iter())
+        .for_each(|(left, right)| *left += *right);
+}
+
+pub fn addition_rayon(left: &mut [f32], right: &[f32]) {
+    left.par_iter_mut()
+        .zip(right.par_iter())
+        .for_each(|(left, right)| *left += *right);
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum UploadStyle {
+    Mapping,
+    Staging,
+}
+
+struct AutomatedBuffer {
+    inner: Buffer,
+    style: UploadStyle,
+    size: BufferAddress,
+}
+impl AutomatedBuffer {
+    pub fn new(
+        device: &Device,
+        size: BufferAddress,
+        other_usages: BufferUsage,
+        label: Option<&str>,
+        style: UploadStyle,
+    ) -> Self {
+        let inner = device.create_buffer(&BufferDescriptor {
+            size,
+            usage: match style {
+                UploadStyle::Mapping => {
+                    other_usages | BufferUsage::MAP_READ | BufferUsage::MAP_WRITE
+                }
+                UploadStyle::Staging => {
+                    other_usages | BufferUsage::COPY_SRC | BufferUsage::COPY_DST
+                }
+            },
+            label,
+        });
+
+        Self { inner, style, size }
+    }
+
+    fn map_read<T: Future<Output = Result<BufferReadMapping, BufferAsyncErr>>>(
+        mapping: T,
+    ) -> impl Future<Output = BufferReadMapping> {
+        async move { mapping.await.unwrap() }
+    }
+
+    pub fn read_from_buffer<'a>(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+    ) -> impl Future<Output = BufferReadMapping> {
+        match self.style {
+            UploadStyle::Mapping => Self::map_read(self.inner.map_read(0, self.size)),
+            UploadStyle::Staging => {
+                let staging = device.create_buffer(&BufferDescriptor {
+                    size: self.size,
+                    usage: BufferUsage::MAP_READ | BufferUsage::COPY_DST,
+                    label: Some("read dst buffer"),
+                });
+                encoder.copy_buffer_to_buffer(&self.inner, 0, &staging, 0, self.size);
+                Self::map_read(staging.map_read(0, self.size))
+            }
+        }
+    }
+
+    fn map_write<'a>(
+        data: &'a [u8],
+        mapping: Option<impl Future<Output = Result<BufferWriteMapping, BufferAsyncErr>> + 'a>,
+    ) -> impl Future<Output = ()> + 'a {
+        async move {
+            if let Some(mapping) = mapping {
+                mapping.await.unwrap().as_slice().copy_from_slice(data);
+            }
+        }
+    }
+
+    pub fn write_to_buffer<'a>(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        data: &'a [u8],
+    ) -> impl Future<Output = ()> + 'a {
+        match self.style {
+            UploadStyle::Mapping => Self::map_write(
+                data,
+                Some(self.inner.map_write(0, data.len() as BufferAddress)),
+            ),
+            UploadStyle::Staging => {
+                let staging = device.create_buffer_with_data(data, BufferUsage::COPY_SRC);
+                encoder.copy_buffer_to_buffer(
+                    &staging,
+                    0,
+                    &self.inner,
+                    0,
+                    data.len() as BufferAddress,
+                );
+                Self::map_write(data, None)
+            }
+        }
+    }
+}
+
+impl Deref for AutomatedBuffer {
+    type Target = Buffer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+pub struct GPUAddition {
+    device: Device,
+    queue: Queue,
+    pipeline: ComputePipeline,
+    left_buffer: AutomatedBuffer,
+    right_buffer: AutomatedBuffer,
+    bind_group: BindGroup,
+    commands: Vec<CommandBuffer>,
+}
+
+impl GPUAddition {
+    pub async fn new(style: UploadStyle, size: usize) -> Self {
+        let size_bytes = size as BufferAddress * 4;
+
+        let adapter = Adapter::request(
+            &RequestAdapterOptions {
+                power_preference: PowerPreference::Default,
+                compatible_surface: None,
+            },
+            BackendBit::all(),
+        )
+        .await
+        .unwrap();
+
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor {
+                extensions: Extensions {
+                    anisotropic_filtering: false,
+                },
+                limits: Limits::default(),
+            })
+            .await;
+
+        let shader_source = include_bytes!("addition.spv");
+        let shader_module =
+            device.create_shader_module(&read_spirv(Cursor::new(&shader_source[..])).unwrap());
+
+        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            bindings: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStage::COMPUTE,
+                    ty: BindingType::StorageBuffer {
+                        dynamic: false,
+                        readonly: false,
+                    },
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStage::COMPUTE,
+                    ty: BindingType::StorageBuffer {
+                        dynamic: false,
+                        readonly: true,
+                    },
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStage::COMPUTE,
+                    ty: BindingType::UniformBuffer { dynamic: false },
+                },
+            ],
+            label: Some("bind group layout"),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            bind_group_layouts: &[&bind_group_layout],
+        });
+
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            layout: &pipeline_layout,
+            compute_stage: ProgrammableStageDescriptor {
+                module: &shader_module,
+                entry_point: "main",
+            },
+        });
+
+        let left_buffer = AutomatedBuffer::new(
+            &device,
+            size_bytes,
+            BufferUsage::STORAGE,
+            Some("left buffer"),
+            style,
+        );
+
+        let right_buffer = AutomatedBuffer::new(
+            &device,
+            size_bytes,
+            BufferUsage::STORAGE_READ,
+            Some("right buffer"),
+            style,
+        );
+
+        let uniform_buffer =
+            device.create_buffer_with_data((size as u32).as_bytes(), BufferUsage::UNIFORM);
+
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            layout: &bind_group_layout,
+            bindings: &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::Buffer {
+                        buffer: &left_buffer,
+                        range: 0..size_bytes,
+                    },
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::Buffer {
+                        buffer: &right_buffer,
+                        range: 0..size_bytes,
+                    },
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::Buffer {
+                        buffer: &uniform_buffer,
+                        range: 0..4,
+                    },
+                },
+            ],
+            label: Some("bind group"),
+        });
+
+        Self {
+            device,
+            queue,
+            pipeline,
+            left_buffer,
+            right_buffer,
+            bind_group,
+            commands: Vec::default(),
+        }
+    }
+
+    pub async fn set_buffers(&mut self, left: &[f32], right: &[f32]) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("set buffers"),
+            });
+
+        let map_left =
+            self.left_buffer
+                .write_to_buffer(&self.device, &mut encoder, left.as_bytes());
+        let map_right =
+            self.right_buffer
+                .write_to_buffer(&self.device, &mut encoder, right.as_bytes());
+
+        self.device.poll(Maintain::Wait);
+
+        map_left.await;
+        map_right.await;
+
+        self.commands.push(encoder.finish());
+    }
+
+    pub async fn run(&mut self, size: usize) -> BufferReadMapping {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("compute encoder"),
+            });
+        let mut cpass = encoder.begin_compute_pass();
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch((size as u32 + 63) / 64, 1, 1);
+        drop(cpass);
+
+        self.commands.push(encoder.finish());
+        self.queue.submit(&self.commands);
+        self.commands.clear();
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("read mapping encoder"),
+            });
+
+        let map_left = self
+            .left_buffer
+            .read_from_buffer(&self.device, &mut encoder);
+
+        self.queue.submit(&[encoder.finish()]);
+        self.device.poll(Maintain::Wait);
+
+        map_left.await
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{GPUAddition, UploadStyle};
+    use async_std::task::block_on;
+    use itertools::{zip, Itertools};
+
+    macro_rules! addition_test {
+        ($name:ident, $function:expr) => {
+            #[test]
+            fn $name() {
+                let mut left = (0..10000).map(|v| v as f32).collect_vec();
+                let right = (0..10000).map(|v| (v + 1) as f32).collect_vec();
+                let result = (0..10000).map(|v| (v + v + 1) as f32).collect_vec();
+
+                $function(&mut left, &right);
+
+                for (i, (left, result)) in zip(left, result).enumerate() {
+                    assert_eq!(left, result, "Index {} failed", i);
+                }
+            }
+        };
+    }
+
+    addition_test!(addition, |left: &mut [f32], right: &[f32]| {
+        crate::addition(left, right);
+    });
+    addition_test!(addition_unchecked, |left: &mut [f32], right: &[f32]| {
+        unsafe { crate::addition_unchecked(left, right) };
+    });
+    addition_test!(addition_iterator, |left: &mut [f32], right: &[f32]| {
+        crate::addition_iterator(left, right);
+    });
+    addition_test!(addition_rayon, |left: &mut [f32], right: &[f32]| {
+        crate::addition_rayon(left, right);
+    });
+    addition_test!(addition_gpu_mapping, |left: &mut [f32], right: &[f32]| {
+        let mut gpu = block_on(GPUAddition::new(UploadStyle::Mapping, left.len()));
+        block_on(gpu.set_buffers(&left, &right));
+        let result_mapping = block_on(gpu.run(left.len()));
+        let bytes = result_mapping.as_slice();
+        let floats =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) };
+        assert_eq!(left.len(), floats.len());
+        left.copy_from_slice(floats);
+    });
+    addition_test!(addition_gpu_staging, |left: &mut [f32], right: &[f32]| {
+        let mut gpu = block_on(GPUAddition::new(UploadStyle::Staging, left.len()));
+        block_on(gpu.set_buffers(&left, &right));
+        let result_mapping = block_on(gpu.run(left.len()));
+        let bytes = result_mapping.as_slice();
+        let floats =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) };
+        assert_eq!(left.len(), floats.len());
+        left.copy_from_slice(floats);
+    });
+}
