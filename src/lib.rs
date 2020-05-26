@@ -432,6 +432,7 @@ impl GPUAddition {
         map_left.await;
         map_right.await;
 
+        // Ensure copy takes place during run
         self.commands.push(encoder.finish());
     }
 
@@ -460,7 +461,6 @@ impl GPUAddition {
         let map_left = self
             .left_buffer
             .read_from_buffer(&self.device, &mut encoder);
-
         self.queue.submit(&[encoder.finish()]);
         let map_left = map_left.await;
         self.device.poll(Maintain::Wait);

@@ -52,15 +52,30 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 BatchSize::LargeInput,
             );
         });
-        let mut gpu = block_on(GPUAddition::new(UploadStyle::Mapping, *size));
         group.bench_with_input(BenchmarkId::new("gpu mapping", size), size, |b, &_size| {
             b.iter_custom(|iterations| {
+                let mut gpu = block_on(GPUAddition::new(UploadStyle::Mapping, *size));
                 let mut duration = Duration::default();
                 for _ in 0..iterations {
                     block_on(gpu.set_buffers(&data, &data));
                     let start = Instant::now();
-                    block_on(gpu.run(*size));
+                    let mapping = block_on(gpu.run(*size));
                     duration += start.elapsed();
+                    drop(mapping);
+                }
+                duration
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("gpu staging", size), size, |b, &_size| {
+            b.iter_custom(|iterations| {
+                let mut gpu = block_on(GPUAddition::new(UploadStyle::Staging, *size));
+                let mut duration = Duration::default();
+                for _ in 0..iterations {
+                    block_on(gpu.set_buffers(&data, &data));
+                    let start = Instant::now();
+                    let mapping = block_on(gpu.run(*size));
+                    duration += start.elapsed();
+                    drop(mapping);
                 }
                 duration
             });
