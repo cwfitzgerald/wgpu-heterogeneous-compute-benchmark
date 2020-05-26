@@ -39,94 +39,156 @@ pub enum UploadStyle {
     Staging,
 }
 
+bitflags::bitflags! {
+    pub struct AutomatedBufferUsage: u8 {
+        const READ = 0b01;
+        const WRITE = 0b10;
+        const ALL = Self::READ.bits | Self::WRITE.bits;
+    }
+}
+
+impl AutomatedBufferUsage {
+    pub fn into_buffer_usage(self, style: UploadStyle) -> BufferUsage {
+        let mut usage = BufferUsage::empty();
+        if self.contains(Self::READ) {
+            match style {
+                UploadStyle::Mapping => usage.insert(BufferUsage::MAP_READ),
+                UploadStyle::Staging => usage.insert(BufferUsage::COPY_SRC),
+            }
+        }
+        if self.contains(Self::WRITE) {
+            match style {
+                UploadStyle::Mapping => usage.insert(BufferUsage::MAP_WRITE),
+                UploadStyle::Staging => usage.insert(BufferUsage::COPY_DST),
+            }
+        }
+        usage
+    }
+}
+
 type BufferReadResult = Result<BufferReadMapping, BufferAsyncErr>;
 type BufferWriteResult = Result<BufferWriteMapping, BufferAsyncErr>;
 
+/// Represents either a mapping future (mapped style) or a function to create
+/// a mapping future (buffered style).
 enum ReadMapFn<MapFut, BufFunc> {
     Mapped(MapFut),
-    Buffed(Buffer, BufFunc),
+    Buffered(BufFunc),
 }
 
-impl<MapFut, BufFunc, BufFut> ReadMapFn<MapFut, BufFunc>
+impl<MapFut, BufFunc> ReadMapFn<MapFut, BufFunc>
 where
     MapFut: Future<Output = BufferReadResult>,
-    BufFunc: FnOnce(&Buffer) -> BufFut,
-    BufFut: Future<Output = BufferReadResult>,
+    BufFunc: FnOnce() -> MapFut,
 {
-    fn prepare_future(self) -> ReadMap<MapFut, BufFut> {
+    /// Creates the mapping future
+    fn prepare_future(self) -> MapFut {
         match self {
-            ReadMapFn::Buffed(buffer, func) => ReadMap::Buffed(func(&buffer)),
-            ReadMapFn::Mapped(mapped) => ReadMap::Mapped(mapped),
+            ReadMapFn::Buffered(func) => func(),
+            ReadMapFn::Mapped(mapped) => mapped,
         }
     }
 }
 
-enum ReadMap<MapFut, BufFut> {
-    Mapped(MapFut),
-    Buffed(BufFut),
-}
-
-impl<MapFut, BufFut> ReadMap<MapFut, BufFut>
-where
-    MapFut: Future<Output = BufferReadResult>,
-    BufFut: Future<Output = BufferReadResult>,
-{
-    async fn await_future(self) -> BufferReadResult {
-        match self {
-            ReadMap::Mapped(fut) => fut.await,
-            ReadMap::Buffed(fut) => fut.await,
-        }
-    }
-}
-
-struct AutomatedBuffer {
+/// A buffer which automatically uses either staging buffers or direct mapping to read/write to its
+/// internal buffer based on the provided [`UploadStyle`]
+pub struct AutomatedBuffer {
     inner: Buffer,
     style: UploadStyle,
+    usage: AutomatedBufferUsage,
     size: BufferAddress,
 }
 impl AutomatedBuffer {
+    /// Creates a new AutomatedBuffer with given settings. All operations directly
+    /// done on the automated buffer according to `usage` will be added to the
+    /// internal buffer's usage flags.
     pub fn new(
         device: &Device,
         size: BufferAddress,
+        usage: AutomatedBufferUsage,
         other_usages: BufferUsage,
         label: Option<&str>,
         style: UploadStyle,
     ) -> Self {
         let inner = device.create_buffer(&BufferDescriptor {
             size,
-            usage: match style {
-                UploadStyle::Mapping => {
-                    other_usages | BufferUsage::MAP_READ | BufferUsage::MAP_WRITE
-                }
-                UploadStyle::Staging => {
-                    other_usages | BufferUsage::COPY_SRC | BufferUsage::COPY_DST
-                }
-            },
+            usage: usage.into_buffer_usage(style) | other_usages,
             label,
         });
 
-        Self { inner, style, size }
+        Self {
+            inner,
+            style,
+            usage,
+            size,
+        }
     }
 
-    fn map_read<MapFut, BufFunc, BufFut>(
+    /// Each of the two futures do different things based on the mapping style.
+    ///
+    /// Mapping:
+    ///  - 1st: No-op
+    ///  - 2nd: Resolves the mapping
+    ///
+    /// Buffered:
+    ///  - 1st: Starts the staging buffer mapping
+    ///  - 2nd: Resolves the mapping
+    ///
+    /// This is done with assistance of a generic helper type. The data for the first
+    /// await is held by [`ReadMapFn`].
+    fn map_read<MapFut, BufFunc>(
         mapping: ReadMapFn<MapFut, BufFunc>,
     ) -> impl Future<Output = impl Future<Output = BufferReadMapping>>
     where
         MapFut: Future<Output = BufferReadResult>,
-        BufFunc: FnOnce(&Buffer) -> BufFut,
-        BufFut: Future<Output = BufferReadResult>,
+        BufFunc: FnOnce() -> MapFut,
     {
         async move {
+            // maps the staging buffer or passes forward the mapping of the real buffer
             let future = mapping.prepare_future();
-            async move { future.await_future().await.unwrap() }
+            async move {
+                // actually resolves the mapping
+                future.await.unwrap()
+            }
         }
     }
 
+    /// Reads the underlying buffer using the proper read style.
+    ///
+    /// This function is unusual because it returns a future which itself returns a future. We shall
+    /// refer to these as the First and the Second future.
+    ///
+    /// This function is safe, but has the following constraints so as to not cause a panic in wgpu:
+    ///  - Buffer usage must contain [`READ`](AutomatedBufferUsage::READ).
+    ///  - The buffer must not be in use by any other command buffer between calling this function
+    ///    and calling await on the Second future.
+    ///  - The First future must be awaited _after_ `encoder`'s command buffer is submitted to the queue and _before_ device.poll is called.
+    ///  - The Second future mut be awaited _after_ device.poll is called and the mapping is resolved.
+    ///
+    /// Example:
+    ///
+    /// ```ignore
+    /// let buffer = AutomatedBuffer::new(..);
+    ///
+    /// let map_read_buf1 = buffer.read_from_buffer(&device, &mut encoder);
+    /// queue.submit(&[encoder.submit()]); // must happen before first await
+    ///
+    /// let map_read_buf2 = map_read_buf1.await;
+    /// device.poll(...); // must happen before second await and after first
+    ///
+    /// let mapping = map_read_buf2.await;
+    /// // use mapping
+    /// ```
     pub fn read_from_buffer(
         &mut self,
         device: &Device,
         encoder: &mut CommandEncoder,
     ) -> impl Future<Output = impl Future<Output = BufferReadMapping>> {
+        assert!(
+            self.usage.contains(AutomatedBufferUsage::READ),
+            "Must have usage READ to read from buffer. Current usage {:?}",
+            self.usage
+        );
         match self.style {
             UploadStyle::Mapping => {
                 Self::map_read(ReadMapFn::Mapped(self.inner.map_read(0, self.size)))
@@ -139,13 +201,13 @@ impl AutomatedBuffer {
                 });
                 encoder.copy_buffer_to_buffer(&self.inner, 0, &staging, 0, self.size);
                 let size = self.size;
-                Self::map_read(ReadMapFn::Buffed(staging, move |staging| {
-                    staging.map_read(0, size)
-                }))
+                Self::map_read(ReadMapFn::Buffered(move || staging.map_read(0, size)))
             }
         }
     }
 
+    /// When the returned future is awaited, writes the data to the buffer if it is a mapped buffer.
+    /// No-op for the use of a staging buffer.
     fn map_write<'a>(
         data: &'a [u8],
         mapping: Option<impl Future<Output = BufferWriteResult> + 'a>,
@@ -157,12 +219,36 @@ impl AutomatedBuffer {
         }
     }
 
+    /// Writes to the underlying buffer using the proper write style.
+    ///
+    /// This function is safe, but has the following constraints so as to not cause a panic in wgpu:
+    ///  - Buffer usage must contain [`WRITE`](AutomatedBufferUsage::WRITE)
+    ///  - The returned future must be awaited _after_ calling device.poll() to resolve it.
+    ///  - The command buffer created by `encoder` must **not** be submitted to a queue before this future is awaited.
+    ///
+    /// Example:
+    ///
+    /// ```ignore
+    /// let buffer = AutomatedBuffer::new(..);
+    ///
+    /// let map_write = buffer.write_to_buffer(&device, &mut encoder, &data);
+    /// device.poll(...); // must happen before await
+    ///
+    /// let mapping = map_write.await; // Calling await will write to the mapping
+    ///
+    /// queue.submit(&[encoder.submit()]); // must happen after await
+    /// ```
     pub fn write_to_buffer<'a>(
         &mut self,
         device: &Device,
         encoder: &mut CommandEncoder,
         data: &'a [u8],
     ) -> impl Future<Output = ()> + 'a {
+        assert!(
+            self.usage.contains(AutomatedBufferUsage::WRITE),
+            "Must have usage WRITE to write to buffer. Current usage {:?}",
+            self.usage
+        );
         match self.style {
             UploadStyle::Mapping => Self::map_write(
                 data,
@@ -270,6 +356,7 @@ impl GPUAddition {
         let left_buffer = AutomatedBuffer::new(
             &device,
             size_bytes,
+            AutomatedBufferUsage::ALL,
             BufferUsage::STORAGE,
             Some("left buffer"),
             style,
@@ -278,6 +365,7 @@ impl GPUAddition {
         let right_buffer = AutomatedBuffer::new(
             &device,
             size_bytes,
+            AutomatedBufferUsage::WRITE,
             BufferUsage::STORAGE_READ,
             Some("right buffer"),
             style,
@@ -374,7 +462,6 @@ impl GPUAddition {
             .read_from_buffer(&self.device, &mut encoder);
 
         self.queue.submit(&[encoder.finish()]);
-
         let map_left = map_left.await;
         self.device.poll(Maintain::Wait);
         map_left.await
