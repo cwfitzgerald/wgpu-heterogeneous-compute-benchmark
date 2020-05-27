@@ -13,7 +13,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
     group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
-    for size in &[1_000, 10_000, 100_000, 1_000_000, 10_000_000, 50_000_000] {
+    for size in &[1_000, 10_000, 100_000, 1_000_000, 3_000_000] {
         let data = vec![1.0_f32; *size];
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::new("scalar safe", size), size, |b, &_size| {
