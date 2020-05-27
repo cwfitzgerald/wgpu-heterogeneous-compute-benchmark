@@ -66,8 +66,8 @@ impl AutomatedBufferUsage {
     }
 }
 
-type BufferReadResult = Result<BufferReadMapping, BufferAsyncErr>;
-type BufferWriteResult = Result<BufferWriteMapping, BufferAsyncErr>;
+type BufferReadResult = Result<BufferReadMapping, BufferAsyncError>;
+type BufferWriteResult = Result<BufferWriteMapping, BufferAsyncError>;
 
 /// Represents either a mapping future (mapped style) or a function to create
 /// a mapping future (buffered style).
@@ -291,24 +291,30 @@ impl GPUAddition {
     pub async fn new(style: UploadStyle, size: usize) -> Self {
         let size_bytes = size as BufferAddress * 4;
 
-        let adapter = Adapter::request(
-            &RequestAdapterOptions {
-                power_preference: PowerPreference::Default,
-                compatible_surface: None,
-            },
-            BackendBit::all(),
-        )
-        .await
-        .unwrap();
+        let instance = Instance::new();
+        let adapter = instance
+            .request_adapter(
+                &RequestAdapterOptions {
+                    power_preference: PowerPreference::Default,
+                    compatible_surface: None,
+                },
+                BackendBit::all(),
+            )
+            .await
+            .unwrap();
 
         let (device, queue) = adapter
-            .request_device(&DeviceDescriptor {
-                extensions: Extensions {
-                    anisotropic_filtering: false,
+            .request_device(
+                &DeviceDescriptor {
+                    extensions: Extensions {
+                        anisotropic_filtering: false,
+                    },
+                    limits: Limits::default(),
                 },
-                limits: Limits::default(),
-            })
-            .await;
+                None,
+            )
+            .await
+            .unwrap();
 
         let shader_source = include_bytes!("addition.spv");
         let shader_module =
@@ -366,7 +372,7 @@ impl GPUAddition {
             &device,
             size_bytes,
             AutomatedBufferUsage::WRITE,
-            BufferUsage::STORAGE_READ,
+            BufferUsage::STORAGE,
             Some("right buffer"),
             style,
         );
@@ -379,24 +385,15 @@ impl GPUAddition {
             bindings: &[
                 Binding {
                     binding: 0,
-                    resource: BindingResource::Buffer {
-                        buffer: &left_buffer,
-                        range: 0..size_bytes,
-                    },
+                    resource: BindingResource::Buffer(left_buffer.slice(..)),
                 },
                 Binding {
                     binding: 1,
-                    resource: BindingResource::Buffer {
-                        buffer: &right_buffer,
-                        range: 0..size_bytes,
-                    },
+                    resource: BindingResource::Buffer(right_buffer.slice(..)),
                 },
                 Binding {
                     binding: 2,
-                    resource: BindingResource::Buffer {
-                        buffer: &uniform_buffer,
-                        range: 0..4,
-                    },
+                    resource: BindingResource::Buffer(uniform_buffer.slice(..)),
                 },
             ],
             label: Some("bind group"),
@@ -449,8 +446,7 @@ impl GPUAddition {
         drop(cpass);
 
         self.commands.push(encoder.finish());
-        self.queue.submit(&self.commands);
-        self.commands.clear();
+        self.queue.submit(self.commands.drain(..));
 
         let mut encoder = self
             .device
@@ -461,7 +457,7 @@ impl GPUAddition {
         let map_left = self
             .left_buffer
             .read_from_buffer(&self.device, &mut encoder);
-        self.queue.submit(&[encoder.finish()]);
+        self.queue.submit(std::iter::once(encoder.finish()));
         let map_left = map_left.await;
         self.device.poll(Maintain::Wait);
         map_left.await
