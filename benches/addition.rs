@@ -71,7 +71,6 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     let start = Instant::now();
                     let _mapping = block_on(gpu.run(*size));
                     duration += start.elapsed();
-                    drop(mapping);
                 }
                 duration
             });
@@ -90,7 +89,6 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     let start = Instant::now();
                     let _mapping = block_on(gpu.run(*size));
                     duration += start.elapsed();
-                    drop(mapping);
                 }
                 duration
             });
