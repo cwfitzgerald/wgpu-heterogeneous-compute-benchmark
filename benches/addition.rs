@@ -13,7 +13,9 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
     group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
-    for size in &[1_000, 10_000, 100_000, 1_000_000, 3_000_000] {
+    for size in &[
+        1_000, 10_000, 100_000, 1_000_000, 3_000_000, 10_000_000, 50_000_000,
+    ] {
         let data = vec![1.0_f32; *size];
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::new("scalar safe", size), size, |b, &_size| {
@@ -66,20 +68,22 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 duration
             });
         });
-        group.bench_with_input(BenchmarkId::new("gpu staging", size), size, |b, &_size| {
-            b.iter_custom(|iterations| {
-                let mut gpu = block_on(GPUAddition::new(UploadStyle::Staging, *size));
-                let mut duration = Duration::default();
-                for _ in 0..iterations {
-                    block_on(gpu.set_buffers(&data, &data));
-                    let start = Instant::now();
-                    let mapping = block_on(gpu.run(*size));
-                    duration += start.elapsed();
-                    drop(mapping);
-                }
-                duration
+        if *size <= 3_000_000 {
+            group.bench_with_input(BenchmarkId::new("gpu staging", size), size, |b, &_size| {
+                b.iter_custom(|iterations| {
+                    let mut gpu = block_on(GPUAddition::new(UploadStyle::Staging, *size));
+                    let mut duration = Duration::default();
+                    for _ in 0..iterations {
+                        block_on(gpu.set_buffers(&data, &data));
+                        let start = Instant::now();
+                        let mapping = block_on(gpu.run(*size));
+                        duration += start.elapsed();
+                        drop(mapping);
+                    }
+                    duration
+                });
             });
-        });
+        }
     }
 }
 
