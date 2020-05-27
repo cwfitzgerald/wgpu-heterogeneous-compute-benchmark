@@ -437,7 +437,7 @@ impl<'a> GPUAddition<'a> {
         self.commands.push(encoder.finish());
     }
 
-    pub async fn run(&mut self, size: usize) -> BufferReadMapping {
+    pub async fn run(&mut self, size: usize) -> () {
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
@@ -462,13 +462,16 @@ impl<'a> GPUAddition<'a> {
             .left_buffer
             .read_from_buffer(&self.device, &mut encoder);
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        // remove the following lines, the leak goes away.
+        // calling await on map_left causes it
         let map_left = map_left.await;
         self.device.poll(Maintain::Wait);
-        map_left.await
+        map_left.await;
     }
 }
 
-#[cfg(test)]
+#[cfg(notest)]
 mod test {
     use crate::{create_device, GPUAddition, UploadStyle};
     use async_std::task::block_on;
