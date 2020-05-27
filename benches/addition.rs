@@ -3,12 +3,17 @@ use criterion::{
     criterion_group, criterion_main, AxisScale, BatchSize, BenchmarkId, Criterion,
     PlotConfiguration, Throughput,
 };
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 use wgpu_heterogeneous_compute_benchmark::{
-    addition, addition_iterator, addition_rayon, addition_unchecked, GPUAddition, UploadStyle,
+    addition, addition_iterator, addition_rayon, addition_unchecked, create_device, GPUAddition,
+    UploadStyle,
 };
 
 pub fn criterion_benchmark(c: &mut Criterion) {
+    env_logger::init();
+
+    let (device, queue) = create_device();
     let mut group = c.benchmark_group("addition");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
@@ -54,12 +59,17 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         });
         group.bench_with_input(BenchmarkId::new("gpu mapping", size), size, |b, &_size| {
             b.iter_custom(|iterations| {
-                let mut gpu = block_on(GPUAddition::new(UploadStyle::Mapping, *size));
                 let mut duration = Duration::default();
                 for _ in 0..iterations {
+                    let mut gpu = block_on(GPUAddition::new(
+                        &device,
+                        &queue,
+                        UploadStyle::Mapping,
+                        *size,
+                    ));
                     block_on(gpu.set_buffers(&data, &data));
                     let start = Instant::now();
-                    let mapping = block_on(gpu.run(*size));
+                    let _mapping = block_on(gpu.run(*size));
                     duration += start.elapsed();
                     drop(mapping);
                 }
@@ -68,12 +78,17 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         });
         group.bench_with_input(BenchmarkId::new("gpu staging", size), size, |b, &_size| {
             b.iter_custom(|iterations| {
-                let mut gpu = block_on(GPUAddition::new(UploadStyle::Staging, *size));
                 let mut duration = Duration::default();
                 for _ in 0..iterations {
+                    let mut gpu = block_on(GPUAddition::new(
+                        &device,
+                        &queue,
+                        UploadStyle::Staging,
+                        *size,
+                    ));
                     block_on(gpu.set_buffers(&data, &data));
                     let start = Instant::now();
-                    let mapping = block_on(gpu.run(*size));
+                    let _mapping = block_on(gpu.run(*size));
                     duration += start.elapsed();
                     drop(mapping);
                 }

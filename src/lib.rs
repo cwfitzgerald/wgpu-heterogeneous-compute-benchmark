@@ -2,6 +2,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::float_cmp)]
 
+use async_std::task::block_on;
 use rayon::prelude::*;
 use std::future::Future;
 use std::io::Cursor;
@@ -31,6 +32,24 @@ pub fn addition_rayon(left: &mut [f32], right: &[f32]) {
     left.par_iter_mut()
         .zip(right.par_iter())
         .for_each(|(left, right)| *left += *right);
+}
+
+pub fn create_device() -> (Device, Queue) {
+    let adapter = block_on(Adapter::request(
+        &RequestAdapterOptions {
+            power_preference: PowerPreference::Default,
+            compatible_surface: None,
+        },
+        BackendBit::all(),
+    ))
+    .unwrap();
+
+    block_on(adapter.request_device(&DeviceDescriptor {
+        extensions: Extensions {
+            anisotropic_filtering: false,
+        },
+        limits: Limits::default(),
+    }))
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -277,9 +296,9 @@ impl Deref for AutomatedBuffer {
     }
 }
 
-pub struct GPUAddition {
-    device: Device,
-    queue: Queue,
+pub struct GPUAddition<'a> {
+    device: &'a Device,
+    queue: &'a Queue,
     pipeline: ComputePipeline,
     left_buffer: AutomatedBuffer,
     right_buffer: AutomatedBuffer,
@@ -287,28 +306,14 @@ pub struct GPUAddition {
     commands: Vec<CommandBuffer>,
 }
 
-impl GPUAddition {
-    pub async fn new(style: UploadStyle, size: usize) -> Self {
+impl<'a> GPUAddition<'a> {
+    pub async fn new(
+        device: &'a Device,
+        queue: &'a Queue,
+        style: UploadStyle,
+        size: usize,
+    ) -> GPUAddition<'a> {
         let size_bytes = size as BufferAddress * 4;
-
-        let adapter = Adapter::request(
-            &RequestAdapterOptions {
-                power_preference: PowerPreference::Default,
-                compatible_surface: None,
-            },
-            BackendBit::all(),
-        )
-        .await
-        .unwrap();
-
-        let (device, queue) = adapter
-            .request_device(&DeviceDescriptor {
-                extensions: Extensions {
-                    anisotropic_filtering: false,
-                },
-                limits: Limits::default(),
-            })
-            .await;
 
         let shader_source = include_bytes!("addition.spv");
         let shader_module =
@@ -470,7 +475,7 @@ impl GPUAddition {
 
 #[cfg(test)]
 mod test {
-    use crate::{GPUAddition, UploadStyle};
+    use crate::{create_device, GPUAddition, UploadStyle};
     use async_std::task::block_on;
     use itertools::{zip, Itertools};
 
@@ -504,7 +509,13 @@ mod test {
         crate::addition_rayon(left, right);
     });
     addition_test!(addition_gpu_mapping, |left: &mut [f32], right: &[f32]| {
-        let mut gpu = block_on(GPUAddition::new(UploadStyle::Mapping, left.len()));
+        let (device, queue) = create_device();
+        let mut gpu = block_on(GPUAddition::new(
+            &device,
+            &queue,
+            UploadStyle::Mapping,
+            left.len(),
+        ));
         block_on(gpu.set_buffers(&left, &right));
         let result_mapping = block_on(gpu.run(left.len()));
         let bytes = result_mapping.as_slice();
@@ -514,7 +525,13 @@ mod test {
         left.copy_from_slice(floats);
     });
     addition_test!(addition_gpu_staging, |left: &mut [f32], right: &[f32]| {
-        let mut gpu = block_on(GPUAddition::new(UploadStyle::Staging, left.len()));
+        let (device, queue) = create_device();
+        let mut gpu = block_on(GPUAddition::new(
+            &device,
+            &queue,
+            UploadStyle::Staging,
+            left.len(),
+        ));
         block_on(gpu.set_buffers(&left, &right));
         let result_mapping = block_on(gpu.run(left.len()));
         let bytes = result_mapping.as_slice();
