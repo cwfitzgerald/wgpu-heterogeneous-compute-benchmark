@@ -35,7 +35,8 @@ pub fn addition_rayon(left: &mut [f32], right: &[f32]) {
 }
 
 pub fn create_device() -> (Device, Queue) {
-    let adapter = block_on(Adapter::request(
+    let instance = Instance::new();
+    let adapter = block_on(instance.request_adapter(
         &RequestAdapterOptions {
             power_preference: PowerPreference::Default,
             compatible_surface: None,
@@ -44,12 +45,16 @@ pub fn create_device() -> (Device, Queue) {
     ))
     .unwrap();
 
-    block_on(adapter.request_device(&DeviceDescriptor {
-        extensions: Extensions {
-            anisotropic_filtering: false,
+    block_on(adapter.request_device(
+        &DeviceDescriptor {
+            extensions: Extensions {
+                anisotropic_filtering: false,
+            },
+            limits: Limits::default(),
         },
-        limits: Limits::default(),
-    }))
+        None,
+    ))
+    .unwrap()
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -85,8 +90,8 @@ impl AutomatedBufferUsage {
     }
 }
 
-type BufferReadResult = Result<BufferReadMapping, BufferAsyncErr>;
-type BufferWriteResult = Result<BufferWriteMapping, BufferAsyncErr>;
+type BufferReadResult = Result<BufferReadMapping, BufferAsyncError>;
+type BufferWriteResult = Result<BufferWriteMapping, BufferAsyncError>;
 
 /// Represents either a mapping future (mapped style) or a function to create
 /// a mapping future (buffered style).
@@ -371,7 +376,7 @@ impl<'a> GPUAddition<'a> {
             &device,
             size_bytes,
             AutomatedBufferUsage::WRITE,
-            BufferUsage::STORAGE_READ,
+            BufferUsage::STORAGE,
             Some("right buffer"),
             style,
         );
@@ -384,24 +389,15 @@ impl<'a> GPUAddition<'a> {
             bindings: &[
                 Binding {
                     binding: 0,
-                    resource: BindingResource::Buffer {
-                        buffer: &left_buffer,
-                        range: 0..size_bytes,
-                    },
+                    resource: BindingResource::Buffer(left_buffer.slice(..)),
                 },
                 Binding {
                     binding: 1,
-                    resource: BindingResource::Buffer {
-                        buffer: &right_buffer,
-                        range: 0..size_bytes,
-                    },
+                    resource: BindingResource::Buffer(right_buffer.slice(..)),
                 },
                 Binding {
                     binding: 2,
-                    resource: BindingResource::Buffer {
-                        buffer: &uniform_buffer,
-                        range: 0..4,
-                    },
+                    resource: BindingResource::Buffer(uniform_buffer.slice(..)),
                 },
             ],
             label: Some("bind group"),
@@ -454,8 +450,7 @@ impl<'a> GPUAddition<'a> {
         drop(cpass);
 
         self.commands.push(encoder.finish());
-        self.queue.submit(&self.commands);
-        self.commands.clear();
+        self.queue.submit(self.commands.drain(..));
 
         let mut encoder = self
             .device
@@ -466,7 +461,7 @@ impl<'a> GPUAddition<'a> {
         let map_left = self
             .left_buffer
             .read_from_buffer(&self.device, &mut encoder);
-        self.queue.submit(&[encoder.finish()]);
+        self.queue.submit(std::iter::once(encoder.finish()));
         let map_left = map_left.await;
         self.device.poll(Maintain::Wait);
         map_left.await

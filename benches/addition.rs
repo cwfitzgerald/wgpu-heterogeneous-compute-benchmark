@@ -3,7 +3,6 @@ use criterion::{
     criterion_group, criterion_main, AxisScale, BatchSize, BenchmarkId, Criterion,
     PlotConfiguration, Throughput,
 };
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 use wgpu_heterogeneous_compute_benchmark::{
     addition, addition_iterator, addition_rayon, addition_unchecked, create_device, GPUAddition,
