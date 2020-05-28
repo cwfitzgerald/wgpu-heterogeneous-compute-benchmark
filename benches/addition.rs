@@ -1,14 +1,17 @@
 use async_std::task::block_on;
 use criterion::{
-    criterion_group, criterion_main, AxisScale, BatchSize, BenchmarkId, Criterion,
+    black_box, criterion_group, criterion_main, AxisScale, BatchSize, BenchmarkId, Criterion,
     PlotConfiguration, Throughput,
 };
 use std::time::{Duration, Instant};
 use wgpu_heterogeneous_compute_benchmark::{
     addition, addition_iterator, addition_rayon, addition_unchecked, GPUAddition, UploadStyle,
 };
+use zerocopy::AsBytes;
 
 pub fn criterion_benchmark(c: &mut Criterion) {
+    env_logger::init();
+
     let mut group = c.benchmark_group("addition");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
@@ -21,7 +24,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("scalar safe", size), size, |b, &_size| {
             b.iter_batched(
                 || (data.clone(), data.clone()),
-                |(mut left, right)| addition(&mut left, &right),
+                |(mut left, right)| {
+                    addition(&mut left, &right);
+
+                    black_box(
+                        left.as_bytes()
+                            .iter()
+                            .fold(true, |left, v| left ^ (*v == 1)),
+                    );
+                },
                 BatchSize::LargeInput,
             );
         });
@@ -31,7 +42,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             |b, &_size| {
                 b.iter_batched(
                     || (data.clone(), data.clone()),
-                    |(mut left, right)| unsafe { addition_unchecked(&mut left, &right) },
+                    |(mut left, right)| {
+                        unsafe { addition_unchecked(&mut left, &right) }
+
+                        black_box(
+                            left.as_bytes()
+                                .iter()
+                                .fold(true, |left, v| left ^ (*v == 1)),
+                        );
+                    },
                     BatchSize::LargeInput,
                 );
             },
@@ -42,7 +61,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             |b, &_size| {
                 b.iter_batched(
                     || (data.clone(), data.clone()),
-                    |(mut left, right)| addition_iterator(&mut left, &right),
+                    |(mut left, right)| {
+                        addition_iterator(&mut left, &right);
+
+                        black_box(
+                            left.as_bytes()
+                                .iter()
+                                .fold(true, |left, v| left ^ (*v == 1)),
+                        );
+                    },
                     BatchSize::LargeInput,
                 );
             },
@@ -50,7 +77,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("scalar rayon", size), size, |b, &_size| {
             b.iter_batched(
                 || (data.clone(), data.clone()),
-                |(mut left, right)| addition_rayon(&mut left, &right),
+                |(mut left, right)| {
+                    addition_rayon(&mut left, &right);
+
+                    black_box(
+                        left.as_bytes()
+                            .iter()
+                            .fold(true, |left, v| left ^ (*v == 1)),
+                    );
+                },
                 BatchSize::LargeInput,
             );
         });
@@ -62,6 +97,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     block_on(gpu.set_buffers(&data, &data));
                     let start = Instant::now();
                     let mapping = block_on(gpu.run(*size));
+                    black_box(
+                        mapping
+                            .as_slice()
+                            .iter()
+                            .fold(true, |left, v| left ^ (*v == 1)),
+                    );
                     duration += start.elapsed();
                     drop(mapping);
                 }
@@ -77,6 +118,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                         block_on(gpu.set_buffers(&data, &data));
                         let start = Instant::now();
                         let mapping = block_on(gpu.run(*size));
+                        black_box(
+                            mapping
+                                .as_slice()
+                                .iter()
+                                .fold(true, |left, v| left ^ (*v == 1)),
+                        );
                         duration += start.elapsed();
                         drop(mapping);
                     }
